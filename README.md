@@ -47,13 +47,20 @@ model/                        source files (configs, custom modeling code, token
   tokenizer_config.json
   adapters/{retrieval,text-matching,clustering,classification}/adapter_config.json
 scripts/
-  embed.py                    reference loader, exposes embed()
-  smoke.py                    end-to-end cosine sanity check
+  embed.py                    torch loader (all 4 tasks)
+  smoke.py                    torch path cosine sanity check
+  embed_onnx.py               torch-free ONNX loader (retrieval only)
+  smoke_onnx.py               ONNX retrieval correctness + parity-vs-torch
+  export_onnx.py              build-time: merge retrieval adapter, export ONNX
+requirements.txt              torch path runtime deps
+requirements-onnx.txt         ONNX path runtime deps (no torch)
 ```
 
 Weight binaries (`model.safetensors`, 4 × `adapter_model.safetensors`) are **not** in the tree — see the Release.
 
 ## Release assets (`v5-nano-8a7f00aa`)
+
+### Torch path
 
 | Asset | Size | SHA256 |
 |---|---:|---|
@@ -63,9 +70,30 @@ Weight binaries (`model.safetensors`, 4 × `adapter_model.safetensors`) are **no
 | `adapter_clustering.safetensors` | 13,586,992 | `80dd657af859b61c286872f15af83cb3bfd3456e9b6201398fee2ef701d06e21` |
 | `adapter_classification.safetensors` | 13,586,992 | `c106c3748866900ecd22edbd49ba124c6c50ae898a53f5cd3ce10a5c091f6f28` |
 
+### ONNX path (retrieval-only)
+
+| Asset | Size | SHA256 |
+|---|---:|---|
+| `model.onnx` | 847,354,038 | `9f45091f1a1bc0affdd89245ca56928c7cc7ffefa79403782e1323eec9513ae6` |
+
+The ONNX export has the **retrieval LoRA adapter merged into the base weights** (encoder forward only — pooling, Matryoshka truncate, and L2-normalize live in the loader). Single-file fp32, opset 17. For the other tasks (text-matching / clustering / classification) use the torch path.
+
 The loader verifies SHA256 of every downloaded asset before installing it into the cache.
 
+## Install matrix
+
+Two runtime options. Pick one based on the host environment:
+
+| Path | Requirements | Tasks supported | Use when |
+|---|---|---|---|
+| **Torch** | `torch`, `transformers<5`, `peft`, `safetensors`, `huggingface_hub`, `numpy` (see `requirements.txt`) | retrieval, text-matching, clustering, classification | Local dev; CCotw; anywhere torch is already on the host. |
+| **ONNX** | `onnxruntime`, `tokenizers`, `numpy` (see `requirements-onnx.txt`) | retrieval only | Ephemeral containers where torch is blocked (e.g. claude.ai project containers, ~2 GB torch eats the layer budget). |
+
+The upper bound on `transformers<5` in `requirements.txt` is deliberate — transformers 5.x has a dynamic-module-cache regression that breaks loading this model's chained relative imports. Validated against `transformers==4.57.1`.
+
 ## Quick start
+
+### Torch path
 
 ```bash
 git clone https://github.com/oaustegard/jina-v5-nano-mirror.git
@@ -74,11 +102,24 @@ pip install -r requirements.txt
 python scripts/smoke.py
 ```
 
-The upper bound on `transformers<5` in `requirements.txt` is deliberate — transformers 5.x has a dynamic-module-cache regression that breaks loading this model's chained relative imports. Validated against `transformers==4.57.1`.
+First run downloads ~478 MB of safetensors into `~/.cache/jina-v5-nano-mirror/sha-8a7f00aac8/` and verifies SHA256. Subsequent runs are zero-network.
 
-First run downloads ~478 MB of weights into `~/.cache/jina-v5-nano-mirror/8a7f00aac8/` and verifies SHA256. Subsequent runs are zero-network.
+### ONNX path (torch-free)
+
+```bash
+git clone https://github.com/oaustegard/jina-v5-nano-mirror.git
+cd jina-v5-nano-mirror
+pip install -r requirements-onnx.txt
+python scripts/embed_onnx.py "test embedding"
+```
+
+First run downloads ~847 MB ONNX (with merged retrieval adapter) into `~/.cache/jina-v5-nano-mirror/sha-8a7f00aac8-onnx/` and verifies SHA256. The tokenizer is copied in from the source tree, no second download. Subsequent runs are zero-network.
+
+To run both paths and verify they match (mean cos > 0.99 across 6 (query, relevant, unrelated) triples + Matryoshka 512/256), install both requirement sets and run `python scripts/smoke_onnx.py`.
 
 ## Programmatic use
+
+### Torch path
 
 ```python
 from scripts.embed import embed
@@ -106,6 +147,29 @@ Matryoshka truncation is supported via `truncate_dim`:
 ```python
 v256 = embed(["…"], task="retrieval", truncate_dim=256)  # → (1, 256)
 ```
+
+### ONNX path
+
+Same shape, retrieval-only, no `task=` argument (the retrieval adapter is baked into the export). `dim` replaces `truncate_dim`:
+
+```python
+from scripts.embed_onnx import embed
+
+docs = embed(
+    ["Vitamin D deficiency causes fatigue, bone pain, muscle weakness."],
+    prompt_name="document",
+    max_length=512,
+)  # → (N, 768) float32, L2-normalized
+q = embed(["symptoms of vitamin D deficiency"], prompt_name="query")
+cosine = float(q[0] @ docs[0])
+
+# Matryoshka:
+v256 = embed(["…"], dim=256)  # → (1, 256), valid dims: 32/64/128/256/512/768
+```
+
+### Pooling decision (ONNX)
+
+The ONNX graph is **encoder forward only** — last-token pooling, Matryoshka truncate, and L2-normalize are all numpy ops in `embed_onnx.py`. The truncate has to happen pre-normalize (otherwise Matryoshka dims aren't unit vectors), so baking pooling+normalize into the graph would foreclose Matryoshka without a separate per-dim export. Numpy ops are cheap; the graph stays general.
 
 ### Tasks
 
@@ -139,7 +203,9 @@ The `.kb` format spec and reference packer/skill are tracked separately and will
 
 ## What this mirror does *not* include
 
-- **ONNX export.** Discussed in [`claude-workspace#73`](https://github.com/oaustegard/claude-workspace/issues/73); deferred because the primary consumer (CCotw) already ships torch and the export work (LoRA merge + last-token-pool wrapper around custom remote code) doesn't pay for itself yet. May appear in a future release tag if a torch-free consumer surfaces.
+- **Per-task ONNX exports** for text-matching / clustering / classification. Only the retrieval adapter is merged into the current ONNX graph. If a torch-free consumer needs another task, file a follow-up — same export pipeline, different `set_adapter()` call.
+- **INT8 / dynamic quantization** of the ONNX graph. Possible future asset, not now.
+- **Pooling baked into the ONNX graph.** Encoder-only export, by design — see "Pooling decision" above.
 - **Sibling models** (`jina-embeddings-v5-text-small`, future v6, etc.). Each gets its own mirror following the same pattern, not refactored into a multi-model repo until at least two siblings exist.
 
 ## Reproducing the mirror

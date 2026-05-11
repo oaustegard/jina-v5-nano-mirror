@@ -1,3 +1,7 @@
+# Runtime requirements for the torch path (scripts/embed.py + scripts/smoke.py).
+# For the torch-free ONNX path, install requirements-onnx.txt instead — its
+# runtime is onnxruntime + tokenizers + numpy + stdlib only.
+#
 # Pinned to known-working versions. The upper bound on transformers is
 # intentional: transformers 5.x has a dynamic-module-cache regression that
 # breaks loading custom models with chained relative imports (this model's
