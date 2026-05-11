@@ -1,0 +1,10 @@
+# Pinned to known-working versions. The upper bound on transformers is
+# intentional: transformers 5.x has a dynamic-module-cache regression that
+# breaks loading custom models with chained relative imports (this model's
+# `configuration_jina_embeddings_v5.py → configuration_eurobert.py`).
+torch>=2.8,<3
+transformers>=4.57,<5
+peft>=0.15,<1
+safetensors>=0.4
+numpy>=1.26
+huggingface_hub>=0.28

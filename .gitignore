@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Weight files belong in GitHub Releases, not the source tree.
+model.safetensors
+model/model.safetensors
+adapters/*/adapter_model.safetensors
+model/adapters/*/adapter_model.safetensors
+*.bin
+*.onnx
+*.onnx_data
+
+# Loader cache target
+.cache/
