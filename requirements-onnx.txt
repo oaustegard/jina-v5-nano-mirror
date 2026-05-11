@@ -1,0 +1,6 @@
+# Runtime requirements for the ONNX path (scripts/embed_onnx.py).
+# Strictly torch-free: suitable for ephemeral containers (e.g. claude.ai
+# project containers) where torch is blocked.
+onnxruntime>=1.18
+tokenizers>=0.20
+numpy>=1.26

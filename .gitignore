@@ -17,3 +17,6 @@ model/adapters/*/adapter_model.safetensors
 
 # Loader cache target
 .cache/
+
+# Build output from scripts/export_onnx.py
+out/
