@@ -73,13 +73,42 @@ dims beat stacks here).
 Efficiency gained: **model 5× smaller** (847 → 170 MB), **vector 12× smaller**
 (3072 → 256 B/doc; index @100k docs 307 → 26 MB).
 
+## Search speed — the 1-bit scan now beats float cosine at every N
+
+Earlier this doc flagged that the 1-bit *search-speed* win only showed up at large
+N — at muninn scale a BLAS float-cosine scan beat the popcount Hamming scan. That
+gap is **closed**: [remax_kb#16](https://github.com/oaustegard/remax_kb/pull/16)
+(merged) replaced the per-byte popcount **LUT gather** with `np.bitwise_count`
+over a **uint64 view** of the XOR (hardware POPCNT, 8× fewer elements before the
+reduction). The shipped `hamming_scan` is now **~10× faster than the old LUT and
+faster than a BLAS float-cosine scan at every corpus size** — while the codes stay
+bit-packed (256 B/row), so the 12× storage win is untouched.
+
+Latency per query, ms (merged `remax_kb.hamming_scan` vs `-(corpus @ query)`
+BLAS; d=512/k=4 → 256 B/row, fp32 baseline 768-d; 4-vCPU CPU, single-thread BLAS,
+numpy 2.4.4, best-of-40):
+
+| N (docs) | Hamming scan (merged) | float cosine (BLAS) | Hamming speedup |
+|---:|---:|---:|---:|
+| 600 | **0.039** | 0.074 | 1.9× |
+| 2,000 | **0.127** | 0.253 | 2.0× |
+| 10,000 | **0.725** | 1.851 | 2.6× |
+| 100,000 | **10.98** | 25.08 | 2.3× |
+| 1,000,000 | **237.9** | 252.3 | 1.1× |
+
+The 1-bit stack is now **small *and* fast at all N** — not just large-N. The ±1
+BLAS-matmul reformulation (`q·D = nbits − 2·Hamming`) ranks identically but is
+2–6× slower than the popcount path *and* must un-pack the corpus (8–32× RAM),
+forfeiting the storage win — so popcount, not GEMM, is the right kernel here.
+
 ## Caveats
 
-- **Small, not fast, at small N.** The 1-bit *storage* win is real everywhere;
-  the 1-bit *search-speed* win is a large-N phenomenon. At muninn scale a numpy
-  BLAS float-cosine scan beats the current popcount Hamming scan (0.05 vs 0.50
-  ms/query @600 docs). Closing that gap is tracked in
-  [remax_kb#15](https://github.com/oaustegard/remax_kb/issues/15).
+- **Storage and speed both win now.** The 1-bit *storage* win was always there;
+  as of [remax_kb#16](https://github.com/oaustegard/remax_kb/pull/16) the
+  *search-speed* win is too — the popcount Hamming scan beats a BLAS float-cosine
+  scan at every N, including muninn scale (see *Search speed* above). The old
+  "small but not fast at small N" caveat (tracked as
+  [remax_kb#15](https://github.com/oaustegard/remax_kb/issues/15)) is resolved.
 - **n=5 acceptance queries** — directional, not a leaderboard number. The R@5
   loss is concentrated; R@10 is robust.
 - **In-vocabulary queries.** The residual a hosted embedder buys over pure
@@ -97,4 +126,6 @@ python scripts/quantize_onnx.py model.onnx model.int8.onnx --int8     # 212 MB, 
 ```
 
 Methodology + raw runs: claude-workspace `experiments/{jina-int8-remax_kb,
-muninn-embedder-bakeoff,recall-per-byte,rotation-decorrelation}`.
+muninn-embedder-bakeoff,recall-per-byte,rotation-decorrelation,
+remax-hamming-speedup}` (the last for the search-speed table above —
+`repro_merged.py` times the merged kernel).
