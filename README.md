@@ -33,6 +33,7 @@ This mirror is unmodified — source files are byte-identical to the pinned upst
 ```
 LICENSE                       CC-BY-NC-4.0 legal code
 README.md                     this file
+PERFORMANCE.md                quantized-variant benchmarks + the remax/remax_kb stack
 model/                        source files (configs, custom modeling code, tokenizer)
   config.json
   config_sentence_transformers.json
@@ -52,6 +53,7 @@ scripts/
   embed_onnx.py               torch-free ONNX loader (retrieval only)
   smoke_onnx.py               ONNX retrieval correctness + parity-vs-torch
   export_onnx.py              build-time: merge retrieval adapter, export ONNX
+  quantize_onnx.py            build-time: int4 (q4) / int8 quantize of model.onnx
 requirements.txt              torch path runtime deps
 requirements-onnx.txt         ONNX path runtime deps (no torch)
 ```
@@ -74,9 +76,12 @@ Weight binaries (`model.safetensors`, 4 × `adapter_model.safetensors`) are **no
 
 | Asset | Size | SHA256 |
 |---|---:|---|
-| `model.onnx` | 847,354,038 | `9f45091f1a1bc0affdd89245ca56928c7cc7ffefa79403782e1323eec9513ae6` |
+| `model.onnx` (fp32) | 847,354,038 | `9f45091f1a1bc0affdd89245ca56928c7cc7ffefa79403782e1323eec9513ae6` |
+| `model.q4.onnx` (int4) | 169,736,452 | `b8b18777a9b49bafb5d14f7db3e2687b7bc60485500c39cd9febdcf1d2552e15` |
 
 The ONNX export has the **retrieval LoRA adapter merged into the base weights** (encoder forward only — pooling, Matryoshka truncate, and L2-normalize live in the loader). Single-file fp32, opset 17. For the other tasks (text-matching / clustering / classification) use the torch path.
+
+**`model.q4.onnx` is a *derived* quantized variant** (not upstream-identical): MatMulNBits 4-bit blockwise + int8 embedding-table mop-up, built by `scripts/quantize_onnx.py`. **170 MB (5× smaller than fp32), retrieval-identical** (per-doc cosine 0.975 to fp32; same R@5/R@10), domain-robust. It's the recommended runtime for the torch-free / download-shy path — see [`PERFORMANCE.md`](PERFORMANCE.md) for the full ledger (and why per-tensor int8, though 2.2× faster, is domain-fragile and not hosted).
 
 The loader verifies SHA256 of every downloaded asset before installing it into the cache.
 
@@ -195,16 +200,37 @@ These are applied automatically by `embed()` and match `config_sentence_transfor
 
 Default: `~/.cache/jina-v5-nano-mirror/<short-sha>/`. Override via `JINA_V5_NANO_CACHE=/some/path` (the `<short-sha>` subdir is appended automatically).
 
-## Feedstock for `.kb`
+## Relationship to remax / remax_kb
 
-This mirror is the embedder dependency for a portable knowledgebase format (`.kb` — manifest + binary vectors + chunks) built on top of [remex](https://github.com/oaustegard/remex)/[remax](https://github.com/oaustegard/remax) centered SimHash binarization. The companion benchmark in [remax PR #44](https://github.com/oaustegard/remax/pull/44) validated this model end-to-end on BEIR/SciFact (1-bit retrieval Δ = −0.028 nDCG@10 vs fp32, zero-training).
+This mirror is the **embedder** in a three-repo stack that compresses semantic
+search to a 1-bit-per-dimension index:
 
-The `.kb` format spec and reference packer/skill are tracked separately and will link back here once filed.
+```
+text → [jina-v5-nano-mirror: fp32 or q4 ONNX] → 768-d L2-normed float
+     → [remax: center + rotate + sign]         → 1-bit StackedSignBit codes
+     → [remax_kb: .kb pack/read + Hamming]      → ranked hits
+```
+
+- **jina-v5-nano-mirror** (this repo) — the model. Hosts fp32 + q4 ONNX; q4 is
+  the small/robust runtime variant.
+- **[remax](https://github.com/oaustegard/remax)** — the compressor. Rank-correct
+  cosine LSH (centered SimHash / `StackedSignBitQuantizer`) turns the float
+  embedding into 1-bit codes. Validated end-to-end on BEIR/SciFact (1-bit Δ =
+  −0.028 nDCG@10 vs fp32, zero-training; [remax PR #44](https://github.com/oaustegard/remax/pull/44)).
+- **[remax_kb](https://github.com/oaustegard/remax_kb)** — the KB. `.kb` format +
+  hybrid retrieval; its `JinaONNXEmbedder` / `JinaQ4ONNXEmbedder` wrap **this
+  repo's ONNX** as the query-time runtime, and the reader does Hamming search
+  over the codes.
+
+**Full-stack compression** (fp32 model + fp32 vector DB → q4 model + 1-bit index,
+muninn corpus): R@5 0.90 → 0.833 (R@10 1.00 → 1.00) for **5× smaller model +
+12× smaller vectors**. Numbers, methodology, and the int8-vs-q4 tradeoff are in
+[`PERFORMANCE.md`](PERFORMANCE.md).
 
 ## What this mirror does *not* include
 
 - **Per-task ONNX exports** for text-matching / clustering / classification. Only the retrieval adapter is merged into the current ONNX graph. If a torch-free consumer needs another task, file a follow-up — same export pipeline, different `set_adapter()` call.
-- **INT8 / dynamic quantization** of the ONNX graph. Possible future asset, not now.
+- **int8 dynamic quantization** as a *hosted* asset. The int4 `model.q4.onnx` is hosted (recommended); per-tensor int8 is faster but domain-fragile, so it's build-it-yourself via `scripts/quantize_onnx.py --int8` rather than a release asset (see [`PERFORMANCE.md`](PERFORMANCE.md)).
 - **Pooling baked into the ONNX graph.** Encoder-only export, by design — see "Pooling decision" above.
 - **Sibling models** (`jina-embeddings-v5-text-small`, future v6, etc.). Each gets its own mirror following the same pattern, not refactored into a multi-model repo until at least two siblings exist.
 
