@@ -81,7 +81,9 @@ Weight binaries (`model.safetensors`, 4 × `adapter_model.safetensors`) are **no
 
 The ONNX export has the **retrieval LoRA adapter merged into the base weights** (encoder forward only — pooling, Matryoshka truncate, and L2-normalize live in the loader). Single-file fp32, opset 17. For the other tasks (text-matching / clustering / classification) use the torch path.
 
-**`model.q4.onnx` is a *derived* quantized variant** (not upstream-identical): MatMulNBits 4-bit blockwise + int8 embedding-table mop-up, built by `scripts/quantize_onnx.py`. **170 MB (5× smaller than fp32), retrieval-identical** (per-doc cosine 0.975 to fp32; same R@5/R@10), domain-robust. It's the recommended runtime for the torch-free / download-shy path — see [`PERFORMANCE.md`](PERFORMANCE.md) for the full ledger (and why per-tensor int8, though 2.2× faster, is domain-fragile and not hosted).
+**`model.q4.onnx` is a *derived* quantized variant** (not upstream-identical): MatMulNBits 4-bit blockwise + int8 embedding-table mop-up, built by `scripts/quantize_onnx.py`. **170 MB (5× smaller than fp32), retrieval-identical** (per-doc cosine 0.975 to fp32; same R@5/R@10), domain-robust.
+
+> ⚠️ **Superseded — example only ([remax_kb#23](https://github.com/oaustegard/remax_kb/issues/23), 2026-06-28).** The model authors ship their own q4 ONNX ([`jinaai/jina-embeddings-v5-text-nano-retrieval` → `onnx/model_q4.onnx`](https://huggingface.co/jinaai/jina-embeddings-v5-text-nano-retrieval/tree/main/onnx), 138 MB) that **beats this one on every axis** — smaller *and* more faithful to fp32 (NFCorpus: cosine 0.976 vs 0.974, nDCG@10 0.4291 vs 0.4250). Our build was a *successful* quantization but the experts' own is better; keep it only as a worked example of how to quantize, and **use the official q4 for real work**. See [`PERFORMANCE.md`](PERFORMANCE.md) for the head-to-head (and why per-tensor int8, though 2.2× faster, is domain-fragile and not hosted).
 
 The loader verifies SHA256 of every downloaded asset before installing it into the cache.
 
@@ -211,16 +213,19 @@ text → [jina-v5-nano-mirror: fp32 or q4 ONNX] → 768-d L2-normed float
      → [remax_kb: .kb pack/read + Hamming]      → ranked hits
 ```
 
-- **jina-v5-nano-mirror** (this repo) — the model. Hosts fp32 + q4 ONNX; q4 is
-  the small/robust runtime variant.
+- **jina-v5-nano-mirror** (this repo) — the model. Hosts the fp32 ONNX and our
+  derived `model.q4.onnx`. ⚠️ Our q4 is **superseded by the authors' official q4**
+  (smaller + more faithful; remax_kb#23) and kept as an example only — prefer the
+  official upstream q4 for the small runtime variant.
 - **[remax](https://github.com/oaustegard/remax)** — the compressor. Rank-correct
   cosine LSH (centered SimHash / `StackedSignBitQuantizer`) turns the float
   embedding into 1-bit codes. Validated end-to-end on BEIR/SciFact (1-bit Δ =
   −0.028 nDCG@10 vs fp32, zero-training; [remax PR #44](https://github.com/oaustegard/remax/pull/44)).
 - **[remax_kb](https://github.com/oaustegard/remax_kb)** — the KB. `.kb` format +
-  hybrid retrieval; its `JinaONNXEmbedder` / `JinaQ4ONNXEmbedder` wrap **this
-  repo's ONNX** as the query-time runtime, and the reader does Hamming search
-  over the codes.
+  hybrid retrieval; its `JinaONNXEmbedder` wraps **this repo's fp32 `model.onnx`**,
+  while `JinaQ4ONNXEmbedder` now loads the **official upstream q4** by default (the
+  example-only `JinaOursQ4ONNXEmbedder` wraps this repo's `model.q4.onnx`). The
+  reader does Hamming search over the codes.
 
 **Full-stack compression** (fp32 model + fp32 vector DB → q4 model + 1-bit index,
 muninn corpus): R@5 0.90 → 0.833 (R@10 1.00 → 1.00) for **5× smaller model +
@@ -230,7 +235,7 @@ muninn corpus): R@5 0.90 → 0.833 (R@10 1.00 → 1.00) for **5× smaller model 
 ## What this mirror does *not* include
 
 - **Per-task ONNX exports** for text-matching / clustering / classification. Only the retrieval adapter is merged into the current ONNX graph. If a torch-free consumer needs another task, file a follow-up — same export pipeline, different `set_adapter()` call.
-- **int8 dynamic quantization** as a *hosted* asset. The int4 `model.q4.onnx` is hosted (recommended); per-tensor int8 is faster but domain-fragile, so it's build-it-yourself via `scripts/quantize_onnx.py --int8` rather than a release asset (see [`PERFORMANCE.md`](PERFORMANCE.md)).
+- **int8 dynamic quantization** as a *hosted* asset. The int4 `model.q4.onnx` is hosted (as a superseded example — prefer the official upstream q4); per-tensor int8 is faster but domain-fragile, so it's build-it-yourself via `scripts/quantize_onnx.py --int8` rather than a release asset (see [`PERFORMANCE.md`](PERFORMANCE.md)).
 - **Pooling baked into the ONNX graph.** Encoder-only export, by design — see "Pooling decision" above.
 - **Sibling models** (`jina-embeddings-v5-text-small`, future v6, etc.). Each gets its own mirror following the same pattern, not refactored into a multi-model repo until at least two siblings exist.
 
