@@ -3,6 +3,34 @@
 How the ONNX variants of this mirror perform, and how the model fits the
 remax (compression) and remax_kb (KB format + retrieval) libraries.
 
+> ## ⚠️ Our `model.q4.onnx` is superseded — use the official upstream q4
+>
+> **Update 2026-06-28 ([remax_kb#23](https://github.com/oaustegard/remax_kb/issues/23)).**
+> The model authors ship their **own** q4 ONNX —
+> [`jinaai/jina-embeddings-v5-text-nano-retrieval` → `onnx/model_q4.onnx`](https://huggingface.co/jinaai/jina-embeddings-v5-text-nano-retrieval/tree/main/onnx)
+> (137.8 MB, HF Optimum, same MatMulNBits int4 family). A head-to-head on BEIR
+> NFCorpus (2058 docs / 100 queries) found it **beats our build on every axis at
+> once** — smaller (138 vs 170 MB) *and* strictly more faithful to fp32:
+>
+> | | our q4 | official q4 |
+> |---|---:|---:|
+> | size | 170 MB | **138 MB** |
+> | per-doc cosine to fp32 | 0.9743 | **0.9763** |
+> | recall@10 vs fp32-kNN | 0.8620 | **0.8700** |
+> | Spearman ρ | 0.9764 | **0.9801** |
+> | nDCG@10 (fp32 = 0.4408) | 0.4250 | **0.4291** |
+>
+> Our `model.q4.onnx` was a **successful** quantization — fp32-parity on the
+> corpora we tested, domain-robust where naive int8 collapsed — but the experts'
+> own quantization is simply better. It should **not** be used for anything beyond
+> a worked example of *how* to quantize the export yourself. **For real use, fetch
+> the official `onnx/model_q4.onnx`.** `remax_kb`'s `JinaQ4ONNXEmbedder` now
+> defaults to the official asset; our build is reachable only via the example-only
+> `JinaOursQ4ONNXEmbedder`. The int8 embedding-table mop-up we expected to be our
+> edge did not pan out — Optimum's generic q4 handles the EuroBERT embedding
+> `Gather` at least as well. Lesson on the tin: **check what upstream already ships
+> before quantizing it yourself.**
+
 ## The stack: where this model sits
 
 ```
@@ -21,13 +49,18 @@ ranked hits      JinaQ4ONNXEmbedder wrap THIS repo's ONNX as the runtime
 - **jina-v5-nano-mirror (this repo)** — hosts the model weights and the
   reference loaders. The fp32 ONNX (`model.onnx`) and the quantized
   `model.q4.onnx` are *derived* retrieval-only exports (the safetensors are the
-  unmodified upstream mirror; the ONNX exports are ours).
+  unmodified upstream mirror; the ONNX exports are ours). **Note:** our
+  `model.q4.onnx` is superseded by the authors' official q4 (see the warning
+  above); `remax_kb`'s `JinaQ4ONNXEmbedder` now loads the official upstream q4 by
+  default, not this repo's `model.q4.onnx`. The fp32 `model.onnx` is unaffected.
 - **[remax](https://github.com/oaustegard/remax)** — rank-correct cosine LSH.
   `StackedSignBitQuantizer` turns the float embedding into 1-bit codes (center +
   random rotation + sign, k stacks). This is what makes the *vector* small.
 - **[remax_kb](https://github.com/oaustegard/remax_kb)** — the `.kb` format +
-  hybrid retrieval. Its `JinaONNXEmbedder` / `JinaQ4ONNXEmbedder` load this
-  repo's ONNX to embed queries; the reader does Hamming search over the codes.
+  hybrid retrieval. Its `JinaONNXEmbedder` loads this repo's fp32 `model.onnx`;
+  `JinaQ4ONNXEmbedder` loads the **official upstream q4** (the example-only
+  `JinaOursQ4ONNXEmbedder` loads this repo's `model.q4.onnx`). The reader does
+  Hamming search over the codes.
 
 ## ONNX variants (derived from `model.onnx`)
 
@@ -39,13 +72,21 @@ cosine R@5/R@10.
 |---|---:|---:|---|---|---|
 | **fp32** (`model.onnx`) | 847 MB | 8.5 ch/s | 0.90 / 1.00 | 1.000 (ref) | ✅ release |
 | int8 dynamic | 212 MB | **18.3 ch/s (2.2×)** | 0.83 / 1.00 | **0.445 OOD** | build-only |
-| **q4** (`model.q4.onnx`) | **170 MB** | 8.9 ch/s | 0.90 / 1.00 | **0.975** | ✅ release |
+| **official q4** (upstream `onnx/model_q4.onnx`) | **138 MB** | ≈fp32 | — | **0.976** | ✅ HF (jinaai) |
+| our q4 (`model.q4.onnx`) — *example only* | 170 MB | 8.9 ch/s | 0.90 / 1.00 | 0.974 | ⚠️ release (superseded) |
 
-- **q4 is the recommended quantized variant**: 5× smaller than fp32, retrieval-
-  identical (0.975 per-doc cosine; same R@5/R@10), and **domain-robust**. Built
-  by `scripts/quantize_onnx.py` (MatMulNBits 4-bit blockwise + int8 embedding
-  mop-up — the mop-up is what gets it below int8's size; without it 4-bit-alone
-  is ~465 MB because the EuroBERT embedding `Gather` stays fp32).
+- **The official upstream q4 is the recommended quantized variant** (see the
+  warning at the top): smaller than ours *and* more faithful to fp32 on every
+  metric measured on NFCorpus (remax_kb#23). Fetch it from
+  [`jinaai/jina-embeddings-v5-text-nano-retrieval`](https://huggingface.co/jinaai/jina-embeddings-v5-text-nano-retrieval/tree/main/onnx).
+- **Our q4 (`model.q4.onnx`) is a worked example, not a recommendation**: 5×
+  smaller than fp32 and fp32-parity on the corpora we tested (0.974 per-doc
+  cosine; same R@5/R@10), domain-robust — a *successful* quantization that the
+  authors' own build nonetheless beats. Built by `scripts/quantize_onnx.py`
+  (MatMulNBits 4-bit blockwise + int8 embedding mop-up — the mop-up is what gets
+  it below int8's size; without it 4-bit-alone is ~465 MB because the EuroBERT
+  embedding `Gather` stays fp32). Keep it as a reference for *how* to quantize,
+  and use the official file for anything real.
 - **int8 is faster (2.2×) but domain-fragile**: per-tensor dynamic int8 collapsed
   to **0.445** per-doc cosine vs fp32 on out-of-domain (medical/NFCorpus) text,
   while q4 held at 0.975. Use int8 only for high-throughput *indexing* of
@@ -121,7 +162,7 @@ forfeiting the storage win — so popcount, not GEMM, is the right kernel here.
 # fp32 export (retrieval adapter merged):
 python scripts/export_onnx.py            # -> model.onnx
 # quantized variants:
-python scripts/quantize_onnx.py model.onnx model.q4.onnx   --bits 4   # 170 MB, recommended
+python scripts/quantize_onnx.py model.onnx model.q4.onnx   --bits 4   # 170 MB, example only (prefer the official upstream q4)
 python scripts/quantize_onnx.py model.onnx model.int8.onnx --int8     # 212 MB, fast/fragile
 ```
 
